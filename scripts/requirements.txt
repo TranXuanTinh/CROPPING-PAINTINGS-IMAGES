@@ -1,0 +1,16 @@
+# YOLO Artwork Cropper — Dependencies
+# =====================================
+# CPU-only. No GPU required.
+#
+# Install:
+#   pip install -r requirements.txt
+
+# Core — detection + image processing
+ultralytics>=8.3.0          # YOLO-World + YOLOv8 (includes torch, torchvision)
+opencv-python>=4.8.0        # Image processing, contour detection, perspective warp
+numpy>=1.24.0               # Array operations
+Pillow>=10.0.0              # Image loading (PIL format for YOLO input)
+
+# Phase 2 — optional, for annotation review + fine-tuning
+# Uncomment if you want to fine-tune a custom YOLOv8 model:
+# albumentations>=1.3.0     # Extra data augmentation for training

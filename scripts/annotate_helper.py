@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+annotate_helper.py
+───────────────────
+Phase 2 helper: generates pre-annotations from YOLO-World detections.
+
+Uses the Phase 1 YOLO-World model to predict bounding boxes on all input
+images, then saves the predictions as YOLO-format label files (.txt) that
+can be loaded into annotation tools (CVAT, Label Studio, LabelImg) for
+human review and correction.
+
+This dramatically reduces annotation time:
+  - From scratch: ~30 seconds per image
+  - Review pre-annotations: ~5 seconds per image
+
+Output structure (YOLO training format):
+  dataset/
+  ├── train/
+  │   ├── images/     ← copies of source images
+  │   └── labels/     ← predicted YOLO-format .txt labels
+  ├── val/
+  │   ├── images/
+  │   └── labels/
+  └── data.yaml       ← dataset configuration
+
+Usage:
+  python annotate_helper.py --input "input images/" --output dataset/
+  python annotate_helper.py --input "input images/" --output dataset/ --split 0.9
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from yolo_config import (
+    SUPPORTED_EXTENSIONS,
+    YOLO_WORLD_MODEL,
+    YOLO_WORLD_CLASSES,
+    YOLO_CONFIDENCE,
+    YOLO_IOU,
+    YOLO_IMGSZ,
+    DEVICE,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate pre-annotations for Phase 2 fine-tuning.",
+    )
+    parser.add_argument(
+        "--input",
+        "-i",
+        required=True,
+        help="Input directory with images.",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="dataset",
+        help="Output directory for YOLO-format dataset (default: 'dataset/').",
+    )
+    parser.add_argument(
+        "--split",
+        type=float,
+        default=0.85,
+        help="Train/val split ratio (default: 0.85 = 85%% train).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for train/val split.",
+    )
+
+    args = parser.parse_args()
+
+    in_dir = Path(args.input)
+    out_dir = Path(args.output)
+
+    # Find all images
+    images = sorted(
+        f for f in in_dir.rglob("*")
+        if f.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+    if not images:
+        print(f"No images found in {in_dir}")
+        return
+
+    print(f"Found {len(images)} images")
+
+    # Load YOLO-World model
+    from ultralytics import YOLOWorld
+
+    model = YOLOWorld(YOLO_WORLD_MODEL)
+    model.set_classes(YOLO_WORLD_CLASSES)
+    print(f"Model loaded: {YOLO_WORLD_MODEL}")
+
+    # Shuffle and split
+    random.seed(args.seed)
+    shuffled = list(images)
+    random.shuffle(shuffled)
+    split_idx = int(len(shuffled) * args.split)
+    train_images = shuffled[:split_idx]
+    val_images = shuffled[split_idx:]
+
+    print(f"Split: {len(train_images)} train, {len(val_images)} val")
+
+    # Create output structure
+    for split_name, split_images in [("train", train_images), ("val", val_images)]:
+        img_dir = out_dir / split_name / "images"
+        lbl_dir = out_dir / split_name / "labels"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        lbl_dir.mkdir(parents=True, exist_ok=True)
+
+        for i, img_path in enumerate(split_images, 1):
+            print(f"  [{split_name}] [{i}/{len(split_images)}] {img_path.name}")
+
+            # Copy image
+            dst_img = img_dir / img_path.name
+            shutil.copy2(str(img_path), str(dst_img))
+
+            # Run detection
+            results = model.predict(
+                source=str(img_path),
+                device=DEVICE,
+                conf=YOLO_CONFIDENCE,
+                iou=YOLO_IOU,
+                imgsz=YOLO_IMGSZ,
+                verbose=False,
+            )
+
+            # Write YOLO-format label
+            lbl_path = lbl_dir / f"{img_path.stem}.txt"
+            with open(lbl_path, "w") as f:
+                if results and len(results[0].boxes) > 0:
+                    img_h, img_w = results[0].orig_shape
+                    for box in results[0].boxes:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        # Convert to YOLO format: class_id cx cy w h (normalised)
+                        x1, y1, x2, y2 = xyxy
+                        cx = (x1 + x2) / 2 / img_w
+                        cy = (y1 + y2) / 2 / img_h
+                        bw = (x2 - x1) / img_w
+                        bh = (y2 - y1) / img_h
+                        # Class 0 = "painting" (single class)
+                        f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+                    print(f"    → {len(results[0].boxes)} detection(s)")
+                else:
+                    print(f"    → no detections (empty label)")
+
+    # Write data.yaml
+    yaml_path = out_dir / "data.yaml"
+    with open(yaml_path, "w") as f:
+        f.write(f"# YOLO artwork detection dataset\n")
+        f.write(f"# Generated by annotate_helper.py\n")
+        f.write(f"# Review and correct labels before training!\n\n")
+        f.write(f"path: {out_dir.resolve()}\n")
+        f.write(f"train: train/images\n")
+        f.write(f"val: val/images\n\n")
+        f.write(f"# Classes\n")
+        f.write(f"names:\n")
+        f.write(f"  0: painting\n")
+
+    print(f"\n✓ Dataset created at {out_dir}/")
+    print(f"  data.yaml: {yaml_path}")
+    print(f"\n⚠️  IMPORTANT: Review and correct the labels before training!")
+    print(f"  Recommended tools: CVAT (cvat.ai), Label Studio (labelstud.io)")
+    print(f"  Or use LabelImg: pip install labelimg && labelimg {out_dir / 'train' / 'images'}")
+
+
+if __name__ == "__main__":
+    main()
