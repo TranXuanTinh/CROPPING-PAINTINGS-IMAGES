@@ -1,8 +1,0 @@
-# YOLOv8 custom dataset for painting detection
-path: /media/tinhtran/01D85BC599D1D460/FreeLancer/ComputerVision/dataset
-train: train/images
-val: val/images
-
-# Classes
-names:
-  0: painting

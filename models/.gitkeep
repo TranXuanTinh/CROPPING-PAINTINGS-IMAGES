@@ -1,3 +1,0 @@
-# This directory stores YOLO model weights.
-# Phase 1: YOLO-World weights are cached at ~/.cache/ultralytics/
-# Phase 2: Fine-tuned weights are saved here as best.pt

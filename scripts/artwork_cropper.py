@@ -113,10 +113,40 @@ def sample_corners(img: np.ndarray, b: int) -> np.ndarray:
 _ROUND_THRESHOLDS = (6, 8, 10, 12, 15, 18, 20, 25, 30, 35)
 
 
+def _sample_edge_strips(img: np.ndarray, depth: int = 3) -> np.ndarray:
+    """
+    Sample background colour from the outermost *depth* pixel rows/columns on
+    all four edges.  More robust than corner patches for tightly-framed oval
+    artworks where corner patches may overlap the artwork itself.
+    """
+    strips = [
+        img[:depth, :],     # top strip
+        img[-depth:, :],    # bottom strip
+        img[:, :depth],     # left strip
+        img[:, -depth:],    # right strip
+    ]
+    pixels = np.vstack([s.reshape(-1, 3) for s in strips]).astype(float)
+    return np.median(pixels, axis=0)
+
+
 def _round_shape_candidates(img: np.ndarray) -> list[dict]:
     h, w = img.shape[:2]
     b = max(15, int(min(h, w) * 0.03))
     bg = sample_corners(img, b)
+
+    # When the artwork fills most of the image, corner patches overlap the
+    # painting, contaminating the background estimate.  Detect this via high
+    # corner patch variance: true white/grey wall has std < 25, but artwork
+    # content typically has std > 30.  Fall back to edge strips (outermost
+    # 3 px rows/columns) which are more reliable for tightly-framed ovals.
+    corner_patches = [
+        img[:b, :b], img[:b, -b:], img[-b:, :b], img[-b:, -b:]
+    ]
+    corner_stds = [float(np.std(p.reshape(-1, 3), axis=0).mean()) for p in corner_patches]
+    avg_corner_std = float(np.mean(corner_stds))
+    if avg_corner_std > 30:
+        bg = _sample_edge_strips(img, depth=max(3, int(min(h, w) * 0.005)))
+
     diff = np.abs(img.astype(float) - bg).mean(axis=2)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
 
@@ -151,30 +181,128 @@ def _round_shape_candidates(img: np.ndarray) -> list[dict]:
     return candidates
 
 
+def _edge_based_round_candidates(img: np.ndarray) -> list[dict]:
+    """
+    Edge-based fallback for round shape detection.
+
+    When a circular painting casts a shadow on the gallery wall, the
+    diff-threshold contour (used by _round_shape_candidates) includes the
+    shadow, inflating extent to ~0.92-0.97 (too rectangular to pass the
+    0.70-0.86 round test).  Edge detection finds the *sharp* painting
+    boundary while ignoring the *soft* shadow gradient, correctly producing
+    extent ~0.785 for true circles.
+
+    Uses multiple Canny threshold pairs and morphological closing kernel
+    sizes to robustly detect the painting edge across varying contrast.
+    """
+    h, w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
+
+    candidates = []
+    seen_fracs = set()  # avoid near-duplicate candidates
+
+    for low, high in [(20, 60), (30, 80), (40, 100), (50, 120)]:
+        edges = cv2.Canny(blurred, low, high)
+        for ksize in [7, 9, 11]:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(
+                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+            c = max(contours, key=cv2.contourArea)
+            area = cv2.contourArea(c)
+            frac = area / (h * w)
+            if not (0.10 < frac < 0.90) or len(c) < 5:
+                continue
+            # De-duplicate: skip if we already have a candidate within 2% frac
+            frac_key = round(frac, 2)
+            if frac_key in seen_fracs:
+                continue
+            seen_fracs.add(frac_key)
+
+            rect = cv2.minAreaRect(c)
+            rw, rh = rect[1]
+            rect_area = rw * rh
+            if rect_area <= 0:
+                continue
+            extent = area / rect_area
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            candidates.append({
+                "t": f"edge_{low}_{high}_k{ksize}", "contour": c,
+                "area": area, "frac": frac,
+                "extent": extent, "solidity": solidity, "nverts": len(approx),
+            })
+    return candidates
+
+
 def detect_round_shape(img: np.ndarray) -> dict | None:
     """
     Return the best-matching round/oval candidate dict, or None if the
     artwork looks rectangular.
+
+    Two-pass strategy:
+      Pass 1 (diff-based): background-subtraction contours across multiple
+              thresholds.  Works well when the painting boundary is clean.
+      Pass 2 (edge-based): Canny edge contours — fires only when Pass 1
+              finds candidates but all have high extent (>0.86), indicating
+              shadow contamination inflated the contours.  Edge detection
+              finds the sharp painting edge while ignoring the soft shadow.
     """
     candidates = _round_shape_candidates(img)
-    if not candidates:
-        return None
-    round_like = [c for c in candidates
-                  if 0.70 < c["extent"] < 0.86 and c["solidity"] > 0.96 and c["nverts"] > 7]
-    if len(round_like) < max(2, len(candidates) // 3):
-        return None
-    # Most representative candidate: the one whose frac is closest to the
-    # median frac among round-like hits (avoids picking a threshold-noise outlier).
-    fracs = sorted(c["frac"] for c in round_like)
-    med = fracs[len(fracs) // 2]
-    return min(round_like, key=lambda c: abs(c["frac"] - med))
+
+    # Pass 1: diff-based detection
+    if candidates:
+        round_like = [c for c in candidates
+                      if 0.70 < c["extent"] < 0.86 and c["solidity"] > 0.96 and c["nverts"] > 7]
+        if len(round_like) >= max(2, len(candidates) // 2):
+            fracs = sorted(c["frac"] for c in round_like)
+            med = fracs[len(fracs) // 2]
+            return min(round_like, key=lambda c: abs(c["frac"] - med))
+
+    # Pass 2: edge-based fallback — fires when:
+    #   (a) diff candidates exist but ALL have high extent (shadow contamination)
+    #   (b) diff candidates exist with SOME round-like hits but not enough
+    #       consensus (e.g. colored background creates gradient artifacts at
+    #       intermediate thresholds — imgi_123 yellow circle on teal wall)
+    # If there are zero diff candidates, the image likely has no distinct
+    # foreground object at all, so skip edge detection.
+    diff_has_some_round = candidates and any(
+        0.70 < c["extent"] < 0.86 for c in candidates)
+    diff_all_high = candidates and all(c["extent"] > 0.86 for c in candidates)
+
+    if candidates and (diff_all_high or diff_has_some_round):
+        edge_cands = _edge_based_round_candidates(img)
+        if edge_cands:
+            edge_round = [c for c in edge_cands
+                          if 0.70 < c["extent"] < 0.86
+                          and c["solidity"] > 0.96 and c["nverts"] > 7]
+            if len(edge_round) >= 1:
+                fracs = sorted(c["frac"] for c in edge_round)
+                med = fracs[len(fracs) // 2]
+                best = min(edge_round, key=lambda c: abs(c["frac"] - med))
+                print(f"  [round] Edge-based detection succeeded "
+                      f"(extent={best['extent']:.3f}, frac={best['frac']:.0%})")
+                return best
+
+    return None
 
 
-def ellipse_aabb(ellipse, img_h: int, img_w: int):
+def ellipse_aabb(ellipse, img_h: int, img_w: int, margin: int = 3):
     """
     Axis-aligned bounding box that exactly contains a (possibly rotated)
     ellipse, as returned by cv2.fitEllipse: ((cx, cy), (MA, ma), angle).
     Returns (x1, y1, x2, y2) clipped to the image, or None if degenerate.
+
+    A small *margin* (default 3 px) is added on each side to prevent
+    sub-pixel clipping at the ellipse boundary — the mathematical AABB is
+    exact for continuous coordinates, but after rounding to integers and
+    JPEG compression the outermost pixel row can lose artwork content.
     """
     (cx, cy), (ma_w, ma_h), angle = ellipse
     theta = np.radians(angle)
@@ -182,7 +310,7 @@ def ellipse_aabb(ellipse, img_h: int, img_w: int):
     ux = float(np.sqrt((a * np.cos(theta)) ** 2 + (bb * np.sin(theta)) ** 2))
     uy = float(np.sqrt((a * np.sin(theta)) ** 2 + (bb * np.cos(theta)) ** 2))
 
-    x1, y1, x2, y2 = cx - ux, cy - uy, cx + ux, cy + uy
+    x1, y1, x2, y2 = cx - ux - margin, cy - uy - margin, cx + ux + margin, cy + uy + margin
     x1, y1 = max(0, int(round(x1))), max(0, int(round(y1)))
     x2, y2 = min(img_w, int(round(x2))), min(img_h, int(round(y2)))
     if x2 <= x1 or y2 <= y1:
@@ -290,11 +418,29 @@ def refine_round_ellipse(gray: np.ndarray, ellipse):
     Snap an initial ellipse estimate (from the diff-threshold contour) onto
     the true photometric boundary via radial gradient search + robust refit.
     Falls back to the original ellipse if refinement doesn't turn up enough
-    reliable edge points.
+    reliable edge points or if the refined result diverges from the coarse.
     """
     pts = _radial_edge_points(gray, ellipse)
     refined = _ransac_ellipse_fit(pts)
-    return refined if refined is not None else ellipse
+    if refined is None:
+        return ellipse
+
+    # Sanity check: reject refinements that diverge from the coarse ellipse.
+    # The RANSAC refit can latch onto noise when the initial contour only
+    # partially covers the circle (e.g. edge-based detection from shadow-
+    # affected gallery images).
+    (cx0, cy0), (ma0, mb0), _ = ellipse
+    (cx1, cy1), (ma1, mb1), _ = refined
+    max_axis = max(ma0, mb0, 1)
+    center_drift = np.sqrt((cx1 - cx0) ** 2 + (cy1 - cy0) ** 2)
+    if center_drift > max_axis * 0.30:
+        return ellipse                      # centre jumped too far
+    if ma1 < ma0 * 0.50 or ma1 > ma0 * 1.50:
+        return ellipse                      # major axis changed too much
+    if mb1 < mb0 * 0.50 or mb1 > mb0 * 1.50:
+        return ellipse                      # minor axis changed too much
+
+    return refined
 
 
 def _ellipse_alpha_mask(shape_hw: tuple, ellipse, offset_x: int, offset_y: int) -> np.ndarray:
@@ -332,7 +478,9 @@ def crop_round(img: np.ndarray, padding: float = 3.0, cutout: bool = False) -> n
     coarse_ellipse = cv2.fitEllipse(cand["contour"])
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     ellipse = refine_round_ellipse(gray, coarse_ellipse)
-    bbox = ellipse_aabb(ellipse, h, w)
+    # Use margin=0 for the tightest possible crop — the white-background
+    # masking below handles any sub-pixel edge artifacts.
+    bbox = ellipse_aabb(ellipse, h, w, margin=0)
     if bbox is None:
         print("  [round] Degenerate ellipse bbox — falling back to bgdiff.")
         return crop_bgdiff(img, padding)
@@ -341,16 +489,21 @@ def crop_round(img: np.ndarray, padding: float = 3.0, cutout: bool = False) -> n
     print(f"  [round] t={cand['t']} extent={cand['extent']:.3f} "
           f"frac={cand['frac']:.0%} ellipse=({x2 - x1}x{y2 - y1}) angle={ellipse[2]:.0f}")
 
-    if padding > 0:
-        x1, y1, x2, y2 = add_padding(x1, y1, x2 - x1, y2 - y1, padding, h, w)
+    # No extra percentage padding — ellipse_aabb's built-in 3px margin is
+    # enough for a tight crop that hugs the oval edge.
     crop = img[y1:y2, x1:x2]
 
-    if not cutout:
-        return crop
-
     mask = _ellipse_alpha_mask(crop.shape[:2], ellipse, x1, y1)
-    b, g, r = cv2.split(crop)
-    return cv2.merge([b, g, r, mask])
+
+    if cutout:
+        b, g, r = cv2.split(crop)
+        return cv2.merge([b, g, r, mask])
+
+    # For 3-channel (JPEG) output, mask the region outside the fitted ellipse
+    # with clean solid white (255, 255, 255) so wall/shadow in corners is removed.
+    alpha = (mask.astype(float) / 255.0)[:, :, np.newaxis]
+    bg_white = np.full_like(crop, 255, dtype=np.uint8)
+    return (crop.astype(float) * alpha + bg_white.astype(float) * (1.0 - alpha)).astype(np.uint8)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
